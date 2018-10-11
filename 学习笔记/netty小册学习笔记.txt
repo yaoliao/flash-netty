@@ -1,0 +1,148 @@
+
+1、ByteBuf 
+	具体结构如图
+	markReaderIndex() 与 resetReaderIndex() 
+	// 前者表示把当前的读指针保存起来，后者表示把当前的读指针恢复到之前保存的值，下面两段代码是等价的
+	
+	writeBytes(byte[] src) 与 buffer.readBytes(byte[] dst)
+	//writeBytes() 表示把字节数组 src 里面的数据全部写到 ByteBuf，而 readBytes() 指的是把 ByteBuf 里面的数据全部读取到 dst，
+	//这里 dst 字节数组的大小通常等于 readableBytes()，而 src 字节数组大小的长度通常小于等于 writableBytes()
+	
+	release() 与 retain()
+	//netty使用推外内存时需要自己回收内存 一般使用工具类 ReferenceCountUtil.release(msg);
+	-----重点-----  
+	当使用MessageToMessageCodec解码以后会自动回收，所以后续的Handler中不用再去手动回收，详见MessageToMessageCodec的注释
+	而且就算调了这个方法也不会去回收了，因为解码后的msg已经不是ReferenceCounted的子类了(详见 AuthHandler.java)
+	
+2、通信协议设计、编解码
+
+	具体协议见图
+	
+	-----重点------
+	在协议中带上具体的数据长度用于拆包 (可以使用netty自带的LengthFieldBasedFrameDecoder.java)   <-----重点----
+	基于上述协议的设计 --> new LengthFieldBasedFrameDecoder(Integer.MAX_VALUE, 7, 4);   7：偏移量  4：长度域的长度   
+	在小册中还有一个操作: 在拆包之前先去判断魔数，用来判断是否是指定的协议  (详见 Spliter.java)
+	
+	编解码可以使用netty的MessageToMessageCodec
+
+3、channel attr()
+	该方法可以为每一个channel绑定自己的特定属性 (小册里用来绑定客户端的登陆信息)
+	
+	-----重点------
+	用法:
+	AttributeKey<Boolean> LOGIN = AttributeKey.newInstance("login");  <---- 这样创建  
+	channel.attr(LOGIN).set(true);
+	
+4、pipeline 与 channelHandler   <-------  重点
+	
+	使用了责任链模式，使得对Handler的添加更加的灵活(就像搭积木一样)
+	
+	ctx.fireChannelRead(msg); 会将任务传递给下一个Handler执行， 
+	如果调用了writeAndFlush()则后续的ChannelInboundHandler将不会去执行,而是执行ChannelOutBoundHandler 
+	
+	在pipeline中InboundHandler的执行顺序与添加的顺序相同，OutBoundHandler 的执行顺序与添加的顺序相反
+	如果pipeline中添加的顺序为 InA InB InC OutA OutB OutC , 则执行时的顺序为  InA -> InB -> InC -> OutC -> OutB -> OutA 
+	
+	ChannelHandler 回调方法的执行顺序为
+	handlerAdded() -> channelRegistered() -> channelActive() -> channelRead() -> channelReadComplete()
+	channelInactive() -> channelUnregistered() -> handlerRemoved()
+	
+	ChannelHandler 热插拔技术(pipeline就是一个链表所以可以动态添加)
+	ctx.pipeline().remove(this);  例如在channelRead()方法中直接remove就可以了
+	
+	------重点------
+	有些channelHandler是可以被共享的(没有成员变量),共享之后就不会每有一个连接就new一个新的Handler了
+	用法：
+		// 1. 加上注解标识，表明该 handler 是可以多个 channel 共享的
+		@ChannelHandler.Sharable
+		public class LoginRequestHandler extends SimpleChannelInboundHandler<LoginRequestPacket> {
+
+			// 2. 构造单例
+			public static final LoginRequestHandler INSTANCE = new LoginRequestHandler();
+
+			protected LoginRequestHandler() {
+			}
+
+		}
+	但是有些ChannelHandler是不能共享的，例如LengthFieldBasedFrameDecoder.java 因为拆包时会在自己的类中维护每个channel读到的数据(是有状态的)
+	
+	
+	ctx.writeAndFlush() 和 ctx.channel().writeAndFlush() 的事件传播路径
+	ctx.writeAndFlush() 会从 pipeline链当前节点开始向前找 OutBoundHandler ,不会经过所有的 OutBoundHandler
+	ctx.channel().writeAndFlush() 会经过所有的 OutBoundHandler
+	例子： 若 pipeline链是这样的  InA InB OutA InC OutB OutC , 在InC中调用writeAndFlush()
+			ctx.writeAndFlush()  --->  OutA
+			ctx.channel().writeAndFlush() ---> OutC OutB OutA
+			
+	注意点：	
+	1、避免在channelRead()中直接调用耗时的业务逻辑,会阻塞别的channel的处理，所以对于这些逻辑要使用 ----->> 自己的线程池
+
+	2、writeAndFlush() 这个方法是一个异步的方法,调用之后，其实是会立即返回的，剩下的所有的操作，都是 Netty 内部有一个任务队列异步执行的
+	所以如果有什么操作需要在 writeAndFlush() 完成之后去执行的话就要使用 addListener()方法
+	xxx.writeAndFlush().addListener(future -> {
+		if (future.isDone()) {
+			// 4. balabala 其他的逻辑
+			long time =  System.currentTimeMillis() - begin;
+		}
+	});
+		
+	3、有的时候如果ChannelHandler太多了，可以将 平行指令 handler 合并 详见 IMHandler.java
+	
+	
+5、SimpleChannelInboundHandler： <------------  这个类很重要,很重要,很重要,很重要  重点  <---------
+
+	不用再通过 if 逻辑来判断当前对象是否是本 handler 可以处理的对象，也不用强转，不用往下传递本 handler 处理不了的对象，
+	这一切都已经交给父类 SimpleChannelInboundHandler 来实现了，我们只需要专注于我们要处理的业务逻辑即可。
+	
+	1、会自动判断传进来的数据类型 2、会自动回收ByteBuf
+	
+	-----重点------
+	在创建时会需要传递一个泛型(SimpleChannelInboundHandler<LoginRequestPacket>) 
+	在channelRead()中会自己去判断当前的msg是否是定义的泛型数据类型，如果是就去执行在channelRead0(),否则自己不处理,直接传递给下一个Handler
+	在SimpleChannelInboundHandler源码中是通过acceptInboundMessage()方法去判断是否执行自定义的channelRead0()方法的，如果有什么骚操作，可以重写这个方法
+
+6、心跳与空闲检测
+
+	作用: 为了避免连接假死的情况
+	
+	空闲检测可以直接使用 IdleStateHandler.java  
+	注意点：1、IdleStateHandler 应该放在 pipeline链的最前面   -----重点------
+			是因为如果插入到最后面的话，如果这条连接读到了数据，但是在 inBound 传播的过程中出错了或者数据处理完完毕就不往后传递了（我们的应用程序属于这类）
+			那么最终 IMIdleStateHandler 就不会读到数据，最终导致误判。
+			
+			2、可以重写channelIdle()在其中自定义假死之后的逻辑
+			
+			3、通常空闲检测时间要比发送心跳的时间的两倍要长一些，这也是为了排除偶发的公网抖动，防止误判。
+			
+	心跳：可以自定义一个心跳包，然后在客户端调用 定时器发送，而服务端要做的就是在接受到心跳包之后回一个心跳包
+		例子：
+		客户端
+		public void channelActive(ChannelHandlerContext ctx) throws Exception {
+			ctx.executor().scheduleAtFixedRate(() -> {
+				ctx.writeAndFlush(new HeartBeatRequestPacket());
+			}, HEARTBEAT_INTERVAL, HEARTBEAT_INTERVAL, TimeUnit.SECONDS);
+
+			super.channelActive(ctx);
+		}
+		
+		服务端
+		protected void channelRead0(ChannelHandlerContext ctx, HeartBeatRequestPacket requestPacket) {
+			ctx.writeAndFlush(new HeartBeatResponsePacket());
+		}
+	
+	
+	
+	
+	
+	
+	
+	
+	
+	
+
+
+
+
+
+
+
